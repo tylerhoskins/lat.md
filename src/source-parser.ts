@@ -102,6 +102,7 @@ const grammarMap = {
   '.java': 'tree-sitter-java.wasm',
   '.js': 'tree-sitter-javascript.wasm',
   '.jsx': 'tree-sitter-javascript.wasm',
+  '.php': 'tree-sitter-php.wasm',
   '.py': 'tree-sitter-python.wasm',
   '.rs': 'tree-sitter-rust.wasm',
   '.ts': 'tree-sitter-typescript.wasm',
@@ -755,6 +756,129 @@ function extractJavaSymbols(tree: Tree): SourceSymbol[] {
   return symbols;
 }
 
+function phpSignature(
+  sourceLines: readonly string[],
+  node: SyntaxNode,
+): string {
+  return sourceLines[node.startPosition.row]?.trim() ?? '';
+}
+
+function phpName(node: SyntaxNode): string | null {
+  const name =
+    extractName(node) ??
+    node.namedChildren.find((child) => child.type === 'name')?.text ??
+    null;
+  return name?.replace(/^\$/, '') ?? null;
+}
+
+function pushPhpSymbol(
+  sourceLines: readonly string[],
+  symbols: SourceSymbol[],
+  node: SyntaxNode,
+  name: string,
+  kind: SourceSymbol['kind'],
+  parent?: string,
+): void {
+  symbols.push({
+    name,
+    kind,
+    ...(parent ? { parent } : {}),
+    startLine: node.startPosition.row + 1,
+    endLine: node.endPosition.row + 1,
+    signature: phpSignature(sourceLines, node),
+  });
+}
+
+function extractPhpVariables(
+  sourceLines: readonly string[],
+  symbols: SourceSymbol[],
+  node: SyntaxNode,
+  parent?: string,
+): void {
+  const kind = node.type === 'const_declaration' ? 'const' : 'variable';
+  for (const child of node.namedChildren) {
+    if (child.type !== 'const_element' && child.type !== 'property_element') {
+      continue;
+    }
+    const name = phpName(child);
+    if (name) pushPhpSymbol(sourceLines, symbols, child, name, kind, parent);
+  }
+}
+
+const phpTypeKinds: Record<string, SourceSymbol['kind']> = {
+  class_declaration: 'class',
+  interface_declaration: 'interface',
+  trait_declaration: 'interface',
+  enum_declaration: 'class',
+};
+
+function collectPhpScope(
+  sourceLines: readonly string[],
+  scope: SyntaxNode,
+  symbols: SourceSymbol[],
+  parent?: string,
+): void {
+  for (const node of scope.namedChildren) {
+    const typeKind = phpTypeKinds[node.type];
+    if (typeKind) {
+      const name = phpName(node);
+      if (!name) continue;
+      pushPhpSymbol(sourceLines, symbols, node, name, typeKind);
+      const body = node.childForFieldName('body');
+      if (body) collectPhpScope(sourceLines, body, symbols, name);
+      continue;
+    }
+
+    if (node.type === 'function_definition' && !parent) {
+      const name = phpName(node);
+      if (name) pushPhpSymbol(sourceLines, symbols, node, name, 'function');
+    } else if (node.type === 'method_declaration' && parent) {
+      const name = phpName(node);
+      if (name)
+        pushPhpSymbol(sourceLines, symbols, node, name, 'method', parent);
+      // The PHP grammar can place promoted constructor properties in an ERROR
+      // node, so recover their names from the parameter text without treating
+      // ordinary parameters as class members.
+      if (name === '__construct') {
+        const parameters = node.childForFieldName('parameters');
+        const promoted = parameters?.text.matchAll(
+          /\b(?:public|protected|private)\s+(?:readonly\s+)?[^,$]+?\s+(\$[A-Za-z_][A-Za-z0-9_]*)/g,
+        );
+        for (const match of promoted ?? []) {
+          pushPhpSymbol(
+            sourceLines,
+            symbols,
+            parameters ?? node,
+            match[1].slice(1),
+            'variable',
+            parent,
+          );
+        }
+      }
+    } else if (
+      node.type === 'const_declaration' ||
+      node.type === 'property_declaration'
+    ) {
+      extractPhpVariables(sourceLines, symbols, node, parent);
+    } else if (node.type === 'enum_case' && parent) {
+      const name = phpName(node);
+      if (name)
+        pushPhpSymbol(sourceLines, symbols, node, name, 'const', parent);
+    } else if (
+      node.type === 'declaration_list' ||
+      node.type === 'enum_declaration_list'
+    ) {
+      collectPhpScope(sourceLines, node, symbols, parent);
+    }
+  }
+}
+
+function extractPhpSymbols(tree: Tree): SourceSymbol[] {
+  const symbols: SourceSymbol[] = [];
+  collectPhpScope(tree.rootNode.text.split('\n'), tree.rootNode, symbols);
+  return symbols;
+}
+
 function extractRustSymbols(tree: Tree): SourceSymbol[] {
   const symbols: SourceSymbol[] = [];
   const root = tree.rootNode;
@@ -1300,6 +1424,7 @@ const symbolExtractors = {
   '.java': extractJavaSymbols,
   '.js': extractTsSymbols,
   '.jsx': extractTsSymbols,
+  '.php': extractPhpSymbols,
   '.py': extractPySymbols,
   '.rs': extractRustSymbols,
   '.ts': extractTsSymbols,
